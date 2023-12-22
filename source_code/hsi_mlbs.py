@@ -1,7 +1,7 @@
 # Importing the libraries
 import tensorflow as tf
 import numpy as np
-import os
+import os, sys
 import scipy.io as sio
 from math import ceil
 
@@ -23,16 +23,16 @@ BATCH_SIZE = 16
 def read_data(dataset_name):                        # Loads Dataset
     path = os.getcwd()
     if dataset_name == 'IP':
-        image = sio.loadmat(path+"\\datasets\\Indian_pines_corrected.mat")["indian_pines_corrected"]
-        label = sio.loadmat(path+"\\datasets\\Indian_pines_gt.mat")["indian_pines_gt"]
+        image = sio.loadmat(path+"\\datasets\\IndianPines\\Indian_pines_corrected.mat")["indian_pines_corrected"]
+        label = sio.loadmat(path+"\\datasets\\IndianPines\\Indian_pines_gt.mat")["indian_pines_gt"]
     elif dataset_name == 'UP':
-        image = sio.loadmat(path+'\\datasets\\PaviaU.mat')['paviaU']
-        label = sio.loadmat(path+'\\datasets\\PaviaU_gt.mat')['paviaU_gt']
+        image = sio.loadmat(path+'\\datasets\\PaviaUniversity\\PaviaU.mat')['paviaU']
+        label = sio.loadmat(path+'\\datasets\\PaviaUniversity\\PaviaU_gt.mat')['paviaU_gt']
     image = np.float64(image)
     label = np.array(label).astype(float)
     return image, label
 
-def normalize_dataset(data):                        # Dataset Normalization
+def normalize_dataset(data):                        # Dataset Min-Max Normalization
     max_val = np.amax(data, axis=(0,1,2))
     min_val = np.amin(data, axis=(0,1,2))
     data_norm = (data - min_val) / (max_val - min_val)
@@ -106,16 +106,18 @@ class ProbMask(tf.keras.layers.Layer):
         self.slope = tf.Variable(slope, dtype=tf.float32)
         self.P = filter_size
         
+        # ? Paper says V intialised from a Normal Distribution
         w_init = tf.random_uniform_initializer(minval=0, maxval=1)
+        # w_init = tf.random_normal_initializer(mean=0, stddev=1)
         self.w = tf.Variable(w_init(shape=(1, filter_size, 1)))
         self.w = tf.Variable(- tf.math.log(1. / self.w - 1.) / self.slope)
-        super(ProbMask, self).__init__(**kwargs)
+        super(ProbMask, self).__init__(**kwargs) 
         
     def build(self, input_shape):
         super(ProbMask, self).build(input_shape)
         
     def call(self, input_tensor):
-        weights = self.w 
+        weights = self.w
         return weights
         #return tf.sigmoid(self.slope * weights)
 
@@ -124,7 +126,7 @@ class ProbMask(tf.keras.layers.Layer):
         lst[-1] = 1
         return tuple(lst)
     
-# The layer that rescales the weights given a sparsity level in probability map.
+# The layer that rescales the weights given a sparsity level in probability map.(Normalisation layer)
 class RescaleProbMask(tf.keras.layers.Layer):
     def __init__(self, sparsity, **kwargs):
         self.alpha = tf.constant(sparsity, dtype=tf.float32)
@@ -138,11 +140,13 @@ class RescaleProbMask(tf.keras.layers.Layer):
         prob_map = self.force_sparsity(input_tensor, alpha = self.alpha)
         return prob_map
 
+    # Paper: Sec3.1: Eq(5): making opt prob unconstrained
     def force_sparsity(self, pixel, alpha):
         p = tf.math.reduce_mean(pixel, axis=1)
         beta = (1 - alpha) / (1 - p)
         le = tf.cast(tf.greater_equal(p, alpha), tf.float32)
         return le * pixel * alpha / p + (1 - le) * (1 - beta * (1 - pixel))
+
 
 class ThresholdRandomMask(tf.keras.layers.Layer):
     def __init__(self, slope = 12, **kwargs):
@@ -163,6 +167,7 @@ class ThresholdRandomMask(tf.keras.layers.Layer):
         if self.slope is not None:
             return tf.sigmoid(self.slope * (inputs-self.thresh))
         else:
+            # INFERENCE
             return inputs > self.thresh
 
     def compute_output_shape(self, input_shape):
@@ -191,6 +196,7 @@ def scheduler(epoch, lr):
     return lr
 
 # Importing and modifying data
+# ! NORMALISATION BEFORE SPLITTING ?
 data_ori, labels_ori = read_data(DATASET_NAME)
 data_norm = normalize_dataset(data_ori)
 
@@ -226,10 +232,10 @@ for i in range(num_class):
 class_weights = np.array(class_weights)
 class_weights_norm = class_weights / np.sum(class_weights)
 class_weights_norm = np.sqrt(class_weights_norm)
-#class_weights_norm = np.square(class_weights_norm)
+# class_weights_norm = np.square(class_weights_norm)
 class_weights_dic = {}
 for i in range(num_class):
-    class_weights_dic[i] = 100*class_weights_norm[i]
+    class_weights_dic[i] = 100 * class_weights_norm[i]
 
 print('Shape of the training images: ', X_train[0].shape)
 print('Shape of the test images: ', X_test[0].shape)
@@ -237,17 +243,16 @@ print('Number of the train samples', X_train.shape[0])
 print('Number of the test samples', X_test.shape[0])
 print('Number of the classes',num_classification)
 
-"Code for model creation, compilation and training."
+# Code for model creation, compilation and training.
 training_input_num = X_train.shape[0]
 num_bands = X_train.shape[1]
 input_image = tf.keras.Input(shape=(num_bands,1), name='input_image')
 
-prob_mask_tensor = ProbMask(slope=pmask_slope,
-                            filter_size = num_bands,name='prob_mask')(input_image)
+prob_mask_tensor = ProbMask(slope=pmask_slope, filter_size = num_bands,name='prob_mask')(input_image)
 thresh_tensor = RescaleProbMask(sparsity = BS/num_bands, name='rescaled_mask')(prob_mask_tensor) 
 tensor_mask = ThresholdRandomMask(slope = sample_slope, name='sampled_mask')(thresh_tensor) 
-
 last_tensor = UnderSample(name='proxy_data')([input_image, tensor_mask])
+
 
 X=tf.keras.layers.Conv1D(64, 15, activation='relu',padding='Same')(last_tensor)
 X=tf.keras.layers.Conv1D(64, 15, activation='relu',padding='Same')(X)   
@@ -268,6 +273,8 @@ model.summary()
 model.compile(optimizer = tf.keras.optimizers.Adam(learning_rate=LR), 
               loss = 'categorical_crossentropy', 
               metrics = ['accuracy'])
+
+# ? TEST DATA USED FOR VALIDATION
 model.fit(x = X_train, y = Y_train,
           validation_data = (X_test, Y_test), 
           epochs=EPOCHS,
